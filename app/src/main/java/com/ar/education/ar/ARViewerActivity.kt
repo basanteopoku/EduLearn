@@ -13,20 +13,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.lifecycleScope
-import com.ar.education.R
 import com.ar.education.data.*
 import com.ar.education.databinding.ActivityArViewerBinding
 import com.ar.education.progress.ProgressRepository
 import com.ar.education.ui.QuizActivity
 import com.google.ar.core.*
 import io.github.sceneview.ar.ArSceneView
-import io.github.sceneview.ar.arcore.getHitAtScreenPoint
-import io.github.sceneview.ar.arcore.getRotation
-import io.github.sceneview.ar.arcore.setSession()
 import io.github.sceneview.ar.node.ArModelNode
 import io.github.sceneview.ar.node.PlacementMode
-import kotlinx.coroutines.launch
 
 class ARViewerActivity : AppCompatActivity() {
 
@@ -41,8 +35,7 @@ class ARViewerActivity : AppCompatActivity() {
     private var markerGenerator: ARMarkerGenerator? = null
     private var isSessionConfigured = false
     private val trackedImages = mutableMapOf<String, AugmentedImage>()
-    
-    // Camera permission launcher
+
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -65,39 +58,34 @@ class ARViewerActivity : AppCompatActivity() {
 
         markerGenerator = ARMarkerGenerator(this)
 
-        // Check if we're in marker mode (no lesson ID provided)
         val lessonId = intent.getStringExtra(EXTRA_LESSON_ID)
         isMarkerMode = lessonId == null
 
         setupViews()
         setupViewModel()
-        
-        // Check for camera permissions before setting up AR
+
         checkCameraPermission()
-        
+
         if (isMarkerMode) {
             setupMarkerMode()
         } else {
             loadLessonData()
         }
-        
+
         checkArCoreAvailability()
     }
 
     private fun setupMarkerMode() {
-        // Show scan overlay in marker mode
         binding.scanOverlay.visibility = View.VISIBLE
         binding.bottomCard.visibility = View.GONE
         binding.topControls.visibility = View.GONE
     }
 
     private fun checkCameraPermission() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) 
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED) {
-            
             requestPermissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
         } else {
-            // Camera permission already granted, set up AR
             setupAR()
         }
     }
@@ -106,10 +94,14 @@ class ARViewerActivity : AppCompatActivity() {
         gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onSingleTapUp(e: MotionEvent): Boolean {
                 if (modelNode == null && !isMarkerMode) {
-                    val frame = arSceneView.currentFrame
                     val session = arSceneView.arSession
-                    if (frame != null && session != null) {
-                        val hitResult = frame.getHitAtScreenPoint(session, e.x, e.y)
+                    val frame = arSceneView.currentFrame
+                    if (session != null && frame != null) {
+                        val hitResults = frame.hitTest(e.x, e.y)
+                        val hitResult = hitResults.firstOrNull {
+                            val trackable = it.trackable
+                            trackable is Plane && trackable.isPoseInPolygon(it.hitPose)
+                        }
                         hitResult?.let {
                             val anchor = session.createAnchor(it.hitPose)
                             loadModel(anchor)
@@ -125,11 +117,19 @@ class ARViewerActivity : AppCompatActivity() {
             false
         }
 
-        // Set up session configuration for marker mode
-        arSceneView.onSessionCreated = { session ->
+        arSceneView.onArSessionCreated = { session ->
             if (isMarkerMode && !isSessionConfigured) {
                 configureAugmentedImages(session)
                 isSessionConfigured = true
+            }
+        }
+
+        arSceneView.onArFrame = {
+            if (isMarkerMode) {
+                val currentFrame = arSceneView.currentFrame
+                if (currentFrame != null) {
+                    updateAugmentedImages(arSceneView.arSession, currentFrame)
+                }
             }
         }
     }
@@ -138,21 +138,19 @@ class ARViewerActivity : AppCompatActivity() {
         try {
             val database = AugmentedImageDatabase(session)
             val markerFiles = markerGenerator?.getAllMarkerFiles() ?: emptyList()
-            
+
             if (markerFiles.isEmpty()) {
                 runOnUiThread {
                     Toast.makeText(this, "No markers found. Please generate markers first.", Toast.LENGTH_LONG).show()
                 }
                 return
             }
-            
+
             for (file in markerFiles) {
                 try {
                     val bitmap = BitmapFactory.decodeFile(file.absolutePath)
                     if (bitmap != null) {
-                        // Extract lesson ID from filename (marker_lessonId.png)
                         val lessonId = file.nameWithoutExtension.replace("marker_", "")
-                        // Use 0.1f (10cm) as the estimated width - adjust based on expected print size
                         database.addImage(lessonId, bitmap, 0.1f)
                         bitmap.recycle()
                     }
@@ -160,19 +158,18 @@ class ARViewerActivity : AppCompatActivity() {
                     // Skip problematic marker files
                 }
             }
-            
-            // Configure the session with augmented image database
+
             val config = Config(session)
             config.augmentedImageDatabase = database
             config.focusMode = Config.FocusMode.AUTO
             config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
-            config.planeFindingMode = Config.PlaneFindingMode.DISABLED // Disable plane finding for marker-only mode
+            config.planeFindingMode = Config.PlaneFindingMode.DISABLED
             session.configure(config)
-            
+
             runOnUiThread {
                 Toast.makeText(this, "Loaded ${markerFiles.size} markers for scanning", Toast.LENGTH_SHORT).show()
             }
-            
+
         } catch (e: Exception) {
             runOnUiThread {
                 Toast.makeText(this, "Failed to configure markers: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -183,15 +180,14 @@ class ARViewerActivity : AppCompatActivity() {
     private fun updateAugmentedImages(session: Session?, frame: Frame) {
         try {
             if (session == null) return
-            
+
             val updatedImages = frame.getUpdatedTrackables(AugmentedImage::class.java)
-            
+
             for (augmentedImage in updatedImages) {
                 when (augmentedImage.trackingState) {
                     TrackingState.TRACKING -> {
-                        // Get the name (lesson ID) associated with this image
                         val name = augmentedImage.name
-                        
+
                         if (name != null && name.isNotEmpty() && !trackedImages.containsKey(name)) {
                             trackedImages[name] = augmentedImage
                             runOnUiThread {
@@ -200,7 +196,6 @@ class ARViewerActivity : AppCompatActivity() {
                         }
                     }
                     TrackingState.STOPPED -> {
-                        // Find and remove the stopped image
                         val keysToRemove = mutableListOf<String>()
                         for ((key, value) in trackedImages) {
                             if (value == augmentedImage) {
@@ -211,39 +206,33 @@ class ARViewerActivity : AppCompatActivity() {
                             trackedImages.remove(key)
                         }
                     }
-                    TrackingState.PAUSED -> {
-                        // Handle paused state if needed
-                    }
+                    TrackingState.PAUSED -> {}
                 }
             }
         } catch (e: Exception) {
-            // Handle exceptions silently - ARCore may throw if session is not ready
+            // Handle exceptions silently
         }
     }
 
     private fun onMarkerDetected(lessonId: String) {
-        // Transition from marker mode to lesson mode
         isMarkerMode = false
-        
-        // Hide scan overlay
+
         binding.scanOverlay.visibility = View.GONE
         binding.bottomCard.visibility = View.VISIBLE
         binding.topControls.visibility = View.VISIBLE
-        
-        // Set the lesson ID in intent and load the lesson
+
         intent.putExtra(EXTRA_LESSON_ID, lessonId)
-        
-        // Initialize the view model for this lesson
+
         val progressRepository = ProgressRepository.getInstance(this)
         val factory = ARViewerViewModelFactory(application, lessonId, progressRepository)
         viewModel = ViewModelProvider(this, factory)[ARViewerViewModel::class.java]
-        
+
         setupViewModelObservers()
         loadLessonData()
-        
+
         Toast.makeText(this, "Marker detected! Loading lesson: $lessonId", Toast.LENGTH_SHORT).show()
     }
-    
+
     private fun setupViews() {
         binding.btnPrevious.setOnClickListener { previousStep() }
         binding.btnNext.setOnClickListener { nextStep() }
@@ -299,29 +288,28 @@ class ARViewerActivity : AppCompatActivity() {
         val lesson = currentLesson ?: return
 
         if (modelNode == null) {
-            lifecycleScope.launch {
-                try {
-                    val newModelNode = ArModelNode(
-                        placementMode = PlacementMode.INSTANT,
-                        engine = arSceneView.engine
-                    ).apply {
-                        loadModelGlb(
-                            glbFileLocation = lesson.modelPath,
-                            autoAnimate = true,
-                            autoScale = true
-                        )
-                        anchor?.let { this.anchorNode = it }
-                    }
-                    modelNode = newModelNode
-                    arSceneView.addChild(newModelNode)
-
-                    val currentStep = currentLesson?.labSteps?.get(currentStepIndex)
-                    currentStep?.modelHighlighting?.let {
-                        applyModelHighlighting(it)
-                    }
-                } catch (e: Exception) {
-                    Toast.makeText(this@ARViewerActivity, "Failed to load model: ${e.message}", Toast.LENGTH_SHORT).show()
+            try {
+                val newModelNode = ArModelNode(
+                    placementMode = PlacementMode.INSTANT
+                ).apply {
+                    parent = arSceneView
+                    loadModelGlbAsync(
+                        context = this@ARViewerActivity,
+                        lifecycle = lifecycle,
+                        glbFileLocation = lesson.modelPath,
+                        autoAnimate = true,
+                        autoScale = true
+                    )
+                    anchor?.let { this.anchor = it }
                 }
+                modelNode = newModelNode
+
+                val currentStep = currentLesson?.labSteps?.get(currentStepIndex)
+                currentStep?.modelHighlighting?.let {
+                    applyModelHighlighting(it)
+                }
+            } catch (e: Exception) {
+                Toast.makeText(this, "Failed to load model: ${e.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
